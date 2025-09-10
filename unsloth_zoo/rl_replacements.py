@@ -60,7 +60,66 @@ def chunked_selective_log_softmax(logits, index):
     return all_per_token_logps
 pass
 
+def calculate_pad_tokens_in_prompt(
+        input_ids: torch.Tensor,
+        logits_to_keep: int,
+        pad_token_id: int
+    ) -> torch.Tensor:
+        """
+        Given prompt tensor, it returns all the left padded tokens in that sequence. so [pad, pad, pad, cat] = 3 tokens 
+        """
+        if logits_to_keep >= input_ids.shape[1]:
+            raise ValueError("logits_to_keep must be smaller than the sequence length.")
+
+        prompt_section = input_ids[:, :-logits_to_keep]
+
+        padding_mask = (prompt_section == pad_token_id)
+
+        pad_token_counts = padding_mask.sum(dim=1)
+
+        return pad_token_counts
+
+def create_completion_attention_mask(
+        completion_input_ids: torch.Tensor,
+        left_pad_tokens_per_prompt: torch.Tensor,
+        max_left_pad: int,
+        pad_token_id: int
+    ) -> torch.Tensor:
+        """
+        Given that we have a sequence, [p,p,p,c,c,c,pad,pad,pad]
+
+        Where p are extra prompt tokens we got from slicing the torch tensor, c is completion tokens
+        and pad are pad tokens, this function would make a completion mask that would 0 out the pad
+        and p tokens. so in this example [0,0,0,1,1,1,0,0,0]
+        """
+        batch_size, completion_len = completion_input_ids.shape
+        device = completion_input_ids.device
+
+        num_tokens_to_mask = max_left_pad - left_pad_tokens_per_prompt
+
+        indices = torch.arange(completion_len, device=device).unsqueeze(0)
+        shift_mask = indices >= num_tokens_to_mask.unsqueeze(1)
+
+        non_padding_mask = (completion_input_ids != pad_token_id)
+
+        final_mask = shift_mask & non_padding_mask
+
+        return final_mask
+
+def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
+    """
+    Moves all padding tokens in each sequence of a batch to the right.
+    """
+    mask = (tensor != pad_id)
+    sorted_indices = torch.argsort(mask, dim=1, descending=True, stable=True)
+    packed_tensor = torch.gather(tensor, 1, sorted_indices)
+
+    return packed_tensor
+
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
+RL_REPLACEMENTS["create_completion_attention_mask"] = create_completion_attention_mask
+RL_REPLACEMENTS["calculate_pad_tokens_in_prompt"] = calculate_pad_tokens_in_prompt
+RL_REPLACEMENTS["left_pack_padding"] = left_pack_padding
 
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
@@ -99,7 +158,6 @@ def grpo_compute_loss(
     if temperature != 1.0: new_logits = new_logits / temperature
     new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
     new = new_x - torch.logsumexp(new_logits, dim = -1)
-
     # x_i - logsumexp(x_i)
     with torch.no_grad():
         if beta != 0.0:
@@ -386,49 +444,100 @@ def grpo_accumulated_loss(
     pass
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
 
-    completion_input_ids = input_ids[:, -logits_to_keep:]
     lm_head = trainer.model.get_output_embeddings().weight
 
-    #breakpoint()
-    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):  
-        new_hidden_states = trainer.model(
-            input_ids = input_ids,
-            attention_mask = attention_mask,
-            pixel_values = pixel_values,
-            image_grid_thw = image_grid_thw,
-            pixel_attention_mask = pixel_attention_mask,
-            image_sizes = image_sizes,
-            logits_to_keep = logits_to_keep + 1,
-        ).logits
+    if pixel_values is None: 
+        left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
-        
-        loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
-            new_hidden_states,
-            old_hidden_states,
-            ref_hidden_states,
-            lm_head,
-            completion_input_ids,
-            completion_mask,
-            advantages,
-            trainer.beta,
-            trainer.accelerator.scaler,
-            n_chunks,
-            kwargs # pass kwargs as a dict
-        )
+        max_left_pad = max(left_pad_tokens_per_prompt).item()
+
+        input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
+
+        completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
+
+        completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id).to(attention_mask.dtype)
+        attention_mask =  input_ids != trainer.processing_class.pad_token_id
+        attention_mask = attention_mask.to(attention_mask.dtype)
+    else: 
+        completion_input_ids = input_ids[:, -logits_to_keep:]
+    
+    unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
+    with torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype):  
+        if pixel_values is None:
+            new_hidden_states = unwrapped_model(
+                    input_ids = input_ids,
+                    attention_mask = attention_mask,
+                    pixel_values = pixel_values,
+                    image_grid_thw = image_grid_thw,
+                    pixel_attention_mask = pixel_attention_mask,
+                    image_sizes = image_sizes,
+                    #logits_to_keep = logits_to_keep + 1,
+                ).logits
+
+            #keep extra logit as we generated a new token
+            new_hidden_states = new_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
+            if ref_hidden_states is not None: 
+                ref_hidden_states = ref_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
+            if old_hidden_states is not None: 
+                old_hidden_states = old_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
+        else: 
+            new_hidden_states = unwrapped_model(
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                pixel_values = pixel_values,
+                image_grid_thw = image_grid_thw,
+                pixel_attention_mask = pixel_attention_mask,
+                image_sizes = image_sizes,
+                logits_to_keep = logits_to_keep + 1,
+            ).logits
+    # breakpoint()
+    # lm_head = lm_head
+    # new_logits = torch.matmul(new_hidden_states, lm_head.t())
+    # new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
+   
+    # with torch.no_grad():
+    #     if trainer.args.beta != 0.0:
+    #         ref_logits = torch.matmul(ref_hidden_states, lm_head.t())
+    #         ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
+    #     else:
+    #         ref_logits = None
+    #     if old_hidden_states is not None:
+    #         old_logits = torch.matmul(old_hidden_states, lm_head.t())
+    #         old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
+            
+    #     else: 
+    #         old_logits = None
+    # breakpoint()
+    # completion_input_ids = completion_input_ids.unsqueeze(-1)
+    # new_x = torch.gather(new_logits, dim = -1, index = completion_input_ids).squeeze(-1)
+    # new = new_x - torch.logsumexp(new_logits, dim = -1)
+
+    # old_x = torch.gather(old_logits, dim = -1, index = completion_input_ids).squeeze(-1)
+    # old = old_x - torch.logsumexp(old_logits, dim = -1)
+
+    # ref_x = torch.gather(ref_logits, dim = -1, index = completion_input_ids).squeeze(-1)
+    # ref = ref_x - torch.logsumexp(ref_logits, dim = -1)
+
+    # breakpoint()
+    loss, completion_length, mean_kl = UnslothEfficientGRPO.apply(
+        new_hidden_states,
+        old_hidden_states,
+        ref_hidden_states,
+        lm_head,
+        completion_input_ids,
+        completion_mask,
+        advantages,
+        trainer.beta,
+        trainer.accelerator.scaler,
+        n_chunks,
+        kwargs # pass kwargs as a dict
+    )
     pass
-    #breakpoint()
-    # Some models like Qwen VL 2 don't have logits_to_keep parameter so you need to trim the output manually. Qwen VL 2.5 however does have it.
-    if new_hidden_states.size(1) != logits_to_keep + 1 : 
-        if ref_hidden_states is not None:
-            ref_hidden_states = ref_hidden_states[:,-(logits_to_keep + 1):,:]
-        new_hidden_states = new_hidden_states[:,-(logits_to_keep + 1):,:]
-        if old_hidden_states is not None: 
-            old_hidden_states = old_hidden_states[:,-(logits_to_keep + 1):,:]
+
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
     return loss, completion_length, mean_kl
-
     # Old non efficient code path
     new_logits = torch.matmul(new_hidden_states, lm_head.t())
     new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
