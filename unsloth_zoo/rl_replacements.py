@@ -182,10 +182,11 @@ RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
 def grpo_compute_loss(
-    ref_logits,
-    new_logits,
-    old_logits,
+    ref_hidden_states,
+    new_hidden_states,
+    old_hidden_states,
     sampling_per_token_logps,
+    lm_head,
     input_ids,
     mask,
     beta,
@@ -208,57 +209,95 @@ def grpo_compute_loss(
     current_gradient_accumulation_steps = kwargs.get("current_gradient_accumulation_steps", 1)
     num_processes = kwargs.get("num_processes", 1)
     use_vllm = kwargs.get("use_vllm", False)
+    n_chunks = 4
     vllm_importance_sampling_cap = kwargs.get("vllm_importance_sampling_cap", 2.0)
     input_ids = input_ids.unsqueeze(-1)
+    
+    if old_hidden_states is not None: 
+        old_hidden_chunks = torch.chunk(old_hidden_states, chunks=n_chunks, dim=1)
+    else: 
+        old_hidden_chunks = [None] * n_chunks 
+    if ref_hidden_states is not None: 
+        ref_hidden_states = torch.chunk(ref_hidden_states, chunks=n_chunks, dim=1)
+    else: 
+        ref_hidden_states = [None] * n_chunks 
+    
+    new_hidden_chunks = torch.chunk(new_hidden_states, chunks=n_chunks, dim=1)
 
-    # Optional logit softcapping and logit dividing
-    if logit_scale_multiply != 0: new_logits = new_logits * logit_scale_multiply
-    if logit_scale_divide   != 0: new_logits = new_logits / logit_scale_divide
-    if logit_softcapping    != 0: new_logits = new_logits * torch.tanh(new_logits / logit_softcapping)
+    input_ids_chunks = torch.chunk(input_ids, chunks=n_chunks, dim=1)
 
-    new_logits = new_logits.to(torch.float32)
-    # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-    if temperature != 1.0: new_logits = new_logits / temperature
-    new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
-    new = new_x - torch.logsumexp(new_logits, dim = -1)
-    # x_i - logsumexp(x_i)
+    ref_log_probs_list = []
+    old_log_probs_list = []
+    new_log_probs_list = []
+
+    
+    for old_h_chunk, new_h_chunk, ref_h_chunk, input_id_chunk in zip(old_hidden_chunks, new_hidden_chunks,ref_hidden_states, input_ids_chunks):
+        #Compute chunked new_logits
+        #new_logits_chunk =  torch.matmul(new_hidden_chunks[0].to(lm_head.dtype), lm_head.t())
+        new_logits_chunk = torch.matmul(new_h_chunk.to(lm_head.dtype), lm_head.t())
+        # Optional logit softcapping and logit dividing
+        if logit_scale_multiply != 0: new_logits_chunk = new_logits_chunk * logit_scale_multiply
+        if logit_scale_divide   != 0: new_logits_chunk = new_logits_chunk / logit_scale_divide
+        if logit_softcapping    != 0: new_logits_chunk = new_logits_chunk * torch.tanh(new_logits_chunk / logit_softcapping)
+        new_logits_chunk = new_logits_chunk.to(torch.float32)
+        
+        #Compute chunked new_logprobs
+        if temperature != 1.0: new_logits_chunk = new_logits_chunk / temperature
+        new_x = torch.gather(new_logits_chunk, dim=-1, index=input_id_chunk).squeeze(-1)
+        new_log_probs_chunk = (new_x - torch.logsumexp(new_logits_chunk, dim=-1)).to(torch.float32)
+        new_log_probs_list.append(new_log_probs_chunk)
+
+        with torch.no_grad():
+            if beta != 0.0:
+                #Compute chunked ref_logits
+                assert ref_h_chunk is not None, "ref_logits should not be None when beta != 0.0"
+                ref_logits_chunk = torch.matmul(ref_h_chunk.to(lm_head.dtype), lm_head.t())
+
+                # Optional logit softcapping and logit dividing
+                if logit_scale_multiply != 0: ref_logits_chunk = ref_logits_chunk * logit_scale_multiply
+                if logit_scale_divide   != 0: ref_logits_chunk = ref_logits_chunk / logit_scale_divide
+                if logit_softcapping    != 0: ref_logits_chunk = ref_logits_chunk * torch.tanh(ref_logits_chunk / logit_softcapping)
+                ref_logits_chunk = ref_logits_chunk.to(torch.float32)
+
+                #Compute chunked old_logprobs
+                if temperature != 1.0: ref_logits_chunk = ref_logits_chunk / temperature
+                ref_x = torch.gather(ref_logits_chunk, dim=-1, index=input_id_chunk).squeeze(-1)
+                ref_log_probs_chunk = (ref_x - torch.logsumexp(ref_logits_chunk, dim=-1)).to(torch.float32)
+                ref_log_probs_list.append(ref_log_probs_chunk)
+
+            if old_h_chunk is not None: 
+                #Compute chunked old_logits
+                old_logits_chunk = torch.matmul(old_h_chunk.to(lm_head.dtype), lm_head.t())
+
+                # Optional logit softcapping and logit dividing
+                if logit_scale_multiply != 0: old_logits_chunk = old_logits_chunk * logit_scale_multiply
+                if logit_scale_divide   != 0: old_logits_chunk = old_logits_chunk / logit_scale_divide
+                if logit_softcapping    != 0: old_logits_chunk = old_logits_chunk * torch.tanh(old_logits_chunk / logit_softcapping)
+                old_logits_chunk = old_logits_chunk.to(torch.float32)
+
+                #Compute chunked old_logprobs
+                if temperature != 1.0: old_logits_chunk = old_logits_chunk / temperature
+                old_x = torch.gather(old_logits_chunk, dim=-1, index=input_id_chunk).squeeze(-1)
+                old_log_probs_chunk = (old_x - torch.logsumexp(old_logits_chunk, dim=-1)).to(torch.float32)
+                old_log_probs_list.append(old_log_probs_chunk)
+    
+    new = torch.cat(new_log_probs_list, dim=1)
+
+    if old_hidden_states is not None: 
+        old = torch.cat(old_log_probs_list, dim=1)
+
+    
+    if ref_hidden_states is not None:
+        ref = torch.cat(ref_log_probs_list, dim=1)
+
     with torch.no_grad():
-        if beta != 0.0:
-            assert ref_logits is not None, "ref_logits should not be None when beta != 0.0"
-            
-            # Optional logit softcapping and logit dividing
-            if logit_scale_multiply != 0: ref_logits = ref_logits * logit_scale_multiply
-            if logit_scale_divide   != 0: ref_logits = ref_logits / logit_scale_divide
-            if logit_softcapping    != 0: ref_logits = ref_logits * torch.tanh(ref_logits / logit_softcapping)
-
-            ref_logits = ref_logits.to(torch.float32)
-            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            if temperature != 1.0: ref_logits = ref_logits / temperature
-            ref_x = torch.gather(ref_logits, dim = -1, index = input_ids).squeeze(-1)
-            ref = ref_x - torch.logsumexp(ref_logits, dim = -1)
-        pass
-
-        if old_logits is not None:
-            # Optional logit softcapping and logit dividing
-            if logit_scale_multiply != 0: old_logits = old_logits * logit_scale_multiply
-            if logit_scale_divide   != 0: old_logits = old_logits / logit_scale_divide
-            if logit_softcapping    != 0: old_logits = old_logits * torch.tanh(old_logits / logit_softcapping)
-
-            old_logits = old_logits.to(torch.float32)
-            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            if temperature != 1.0: old_logits = old_logits / temperature
-            old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
-            old = old_x - torch.logsumexp(old_logits, dim = -1)
-        pass
         if use_vllm and sampling_per_token_logps is not None:
             #must filter out extra prompt tokens in begining after making input_ids left padded
             importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
             importance_sampling_ratio = torch.clamp(
                 importance_sampling_ratio, max=vllm_importance_sampling_cap
             )
-        pass
-    pass
-    
+
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
     if beta != 0.0:
@@ -275,7 +314,7 @@ def grpo_compute_loss(
 
     # Below is forward KL (normal KL)
     # kl_i = torch.exp(old) * (old - new)
-    if old_logits is not None: 
+    if old_hidden_states is not None: 
         log_ratio = new - old
     else:
         log_ratio = new - new.detach()
@@ -372,31 +411,21 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     def forward(ctx, _new_hidden_states, _old_hidden_states, _ref_hidden_states, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
         if extra_kwargs is None:
             extra_kwargs = {}
-        def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, sampling_per_token_logps, input_ids, mask, advantages, scaling):
-            new_logits = torch.matmul(new_hidden_states.to(lm_head.dtype), lm_head.t())
-            new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
+        def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, sampling_per_token_logps,lm_head, input_ids, mask, advantages, scaling):
+            new_hidden_states = new_hidden_states[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
             with torch.no_grad():
                 if beta != 0.0:
-                    ref_logits = torch.matmul(ref_hidden_states.to(lm_head.dtype), lm_head.t())
-                    ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-                else:
-                    ref_logits = None
+                    ref_hidden_states = ref_hidden_states[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
+
                 if old_hidden_states is not None:
-                    old_logits = torch.matmul(old_hidden_states.to(lm_head.dtype), lm_head.t())
-                    old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-                else: 
-                    old_logits = None
-            # if old_hidden_states is not None: 
-            #     old_logits = torch.matmul(old_hidden_states, lm_head.t()) #last logit already excluded
-            #     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-            # else:
-            #     old_logits = None
-            # unsloth_zoo/rl_replacements.py
+                    old_hidden_states = old_hidden_states[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
+
             loss, completion_length, mean_kl, delta, flat_is_ratio = grpo_compute_loss(
-                ref_logits,
-                new_logits,
-                old_logits,
+                new_hidden_states,
+                old_hidden_states,
+                ref_hidden_states,
                 sampling_per_token_logps,
+                lm_head,
                 input_ids,
                 mask,
                 beta,
@@ -422,6 +451,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             old_hidden_states_j,
             ref_hidden_states_j,
             sampling_per_token_logps_j,
+            lm_head,
             input_ids_j,
             mask_j,
             advantages_j,
@@ -432,7 +462,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 compute_loss,
                 argnums = (0,),
                 has_aux = True,
-            )(new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, scaling)
+            )(new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, sampling_per_token_logps_j,lm_head, input_ids_j, mask_j, advantages_j, scaling)
             accumulated_loss             .add_(unscaled_loss)
             accumulated_completion_length.add_(chunk_completion_length)
             accumulated_mean_kl          .add_(chunk_mean_kl)
@@ -490,6 +520,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 old_hidden_states_j,
                 ref_hidden_states_j,
                 sampling_per_token_logps_j,
+                lm_head,
                 input_ids_j,
                 mask_j,
                 advantages_j,
@@ -626,6 +657,7 @@ def grpo_accumulated_loss(
                 image_sizes = image_sizes,
                 logits_to_keep = logits_to_keep + 1,
             ).logits
+
     loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
         new_hidden_states,
         old_hidden_states,
