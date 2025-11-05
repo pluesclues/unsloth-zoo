@@ -365,13 +365,39 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
         "def grpo_compute_loss_slow",
 )
 
+import torch
+
+# Assume grpo_compute_loss, torch_compile_options, and RL_REPLACEMENTS are defined elsewhere
+
 # Unsloth's memory efficient GRPO implementation
 class UnslothEfficientGRPO(torch.autograd.Function):
     # All Unsloth Zoo code licensed under LGPLv3
     @staticmethod
-    def forward(ctx, _new_hidden_states, _old_hidden_states, _ref_hidden_states, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
+    def forward(
+        ctx,
+        _old_hidden_states,
+        _sampling_per_token_logps,
+        lm_head,
+        _full_mask,             # ! ADDED
+        _input_ids,
+        _completion_input_ids,  # ! ADDED
+        _mask,
+        _advantages,
+        model,
+        autocaster,
+        beta,
+        logits_to_keep,
+        scaler = None,
+        max_left_pad = None,
+        n_chunks = 1,
+        ref_model = None,
+        extra_kwargs = None, 
+    ):
         if extra_kwargs is None:
             extra_kwargs = {}
+        
+        # This function is fine. 'input_ids' and 'mask' here will correctly
+        # refer to completion_input_ids and completion_mask.
         def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, sampling_per_token_logps, input_ids, mask, advantages, scaling):
             new_logits = torch.matmul(new_hidden_states.to(lm_head.dtype), lm_head.t())
             new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
@@ -386,19 +412,15 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
                 else: 
                     old_logits = None
-            # if old_hidden_states is not None: 
-            #     old_logits = torch.matmul(old_hidden_states, lm_head.t()) #last logit already excluded
-            #     old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-            # else:
-            #     old_logits = None
+            
             # unsloth_zoo/rl_replacements.py
             loss, completion_length, mean_kl, delta, flat_is_ratio = grpo_compute_loss(
                 ref_logits,
                 new_logits,
                 old_logits,
                 sampling_per_token_logps,
-                input_ids,
-                mask,
+                input_ids, #! This is the completion_input_ids
+                mask,      #! This is the completion_mask
                 beta,
                 advantages,
                 **extra_kwargs,
@@ -410,20 +432,23 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             return scaled_loss, (loss.detach(), completion_length, mean_kl, delta, flat_is_ratio)
         pass
 
-        device =_new_hidden_states.device
-        grad_inputs = torch.empty_like(_new_hidden_states)
-        accumulated_loss              = torch.zeros(1, device = device)
+        device =_old_hidden_states.device
+        grad_inputs = torch.empty_like(_old_hidden_states)
+        accumulated_loss                = torch.zeros(1, device = device)
         accumulated_completion_length = torch.zeros(1, device = device)
         accumulated_mean_kl           = torch.zeros(1, device = device)
         accumulated_delta             = []
         accumulated_flat_is_ratio     = []
+        
+        # This function signature is fine. The *caller* will pass
+        # completion_input_ids_j as the 'input_ids_j' argument.
         def accumulate_chunk(
             new_hidden_states_j,
             old_hidden_states_j,
             ref_hidden_states_j,
             sampling_per_token_logps_j,
-            input_ids_j,
-            mask_j,
+            input_ids_j, #! This will be completion_input_ids_j
+            mask_j,      #! This will be completion_mask_j
             advantages_j,
             scaling,
             grad_inputs_j,
@@ -433,11 +458,11 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 argnums = (0,),
                 has_aux = True,
             )(new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, scaling)
-            accumulated_loss             .add_(unscaled_loss)
+            accumulated_loss                .add_(unscaled_loss)
             accumulated_completion_length.add_(chunk_completion_length)
-            accumulated_mean_kl          .add_(chunk_mean_kl)
-            accumulated_delta            .append(chunk_delta)
-            accumulated_flat_is_ratio    .append(chunk_flat_is_ratio)
+            accumulated_mean_kl           .add_(chunk_mean_kl)
+            accumulated_delta             .append(chunk_delta)
+            accumulated_flat_is_ratio     .append(chunk_flat_is_ratio)
             grad_inputs_j[:] = chunk_grad_input
         pass
 
@@ -448,60 +473,149 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             dynamic = True,
             options = torch_compile_options,
         )
+        pixel_values = extra_kwargs.get('pixel_values',None)
+        image_grid_thw = extra_kwargs.get('image_grid_thw',None)
+        pixel_attention_mask = extra_kwargs.get('pixel_attention_mask',None)
+        image_sizes = extra_kwargs.get('image_sizes',None)
+        
+        # Check if vision inputs are present *before* chunking
+        _are_pixel_values_present = (pixel_values is not None)
+        
+        grad_inputs_chunks = torch.chunk(grad_inputs,       chunks = n_chunks, dim = 0)
+        
+        # Chunk optional vision inputs
+        if pixel_values is not None:
+            pixel_values= torch.chunk(pixel_values, chunks=n_chunks, dim=0)
+        else:
+            pixel_values = [None] * n_chunks
 
-        grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
-        new_hidden_states  = torch.chunk(_new_hidden_states, chunks = n_chunks, dim = 0)
+        if image_grid_thw is not None:
+            image_grid_thws = torch.chunk(image_grid_thw, chunks=n_chunks, dim=0)
+        else:
+            image_grid_thws = [None] * n_chunks
+
+        if pixel_attention_mask is not None:
+            pixel_attention_masks= torch.chunk(pixel_attention_mask, chunks=n_chunks, dim=0)
+        else:
+            pixel_attention_masks = [None] * n_chunks
+
+        if image_sizes is not None:
+            image_sizes_chunks = torch.chunk(image_sizes, chunks=n_chunks, dim=0)
+        else:
+            image_sizes_chunks = [None] * n_chunks
+        
+        # Chunk other optional inputs
         if _old_hidden_states is not None: 
             old_hidden_states  = torch.chunk(_old_hidden_states, chunks = n_chunks, dim = 0)
         else: 
             old_hidden_states = [None] * n_chunks
-        if _ref_hidden_states is not None: 
-            ref_hidden_states  = torch.chunk(_ref_hidden_states, chunks = n_chunks, dim = 0)
-        else: 
-            ref_hidden_states = [None] * n_chunks
+
         if _sampling_per_token_logps is not None: 
             sampling_per_token_logps  = torch.chunk(_sampling_per_token_logps, chunks = n_chunks, dim = 0)
         else:
             sampling_per_token_logps = [None] * n_chunks
-        input_ids          = torch.chunk(_input_ids,         chunks = n_chunks, dim = 0)
-        mask               = torch.chunk(_mask,              chunks = n_chunks, dim = 0)
-        advantages         = torch.chunk(_advantages,        chunks = n_chunks, dim = 0)
+        
+        # Chunk non-optional inputs
+        full_mask            = torch.chunk(_full_mask,             chunks = n_chunks, dim = 0) #! ADDED
+        input_ids            = torch.chunk(_input_ids,             chunks = n_chunks, dim = 0)
+        completion_input_ids = torch.chunk(_completion_input_ids,  chunks = n_chunks, dim = 0) #! ADDED
+        mask                 = torch.chunk(_mask,                  chunks = n_chunks, dim = 0)
+        advantages           = torch.chunk(_advantages,            chunks = n_chunks, dim = 0)
 
         # Get mixed precision scaling if seen
         scaling = scaler.get_scale() if scaler is not None else 1.0
 
         # Force torch.compile to use dynamic shapes for seqlen dim
         # mark_dynamic = lambda x: torch._dynamo.mark_dynamic(x, 1)
+        # breakpoint() # Left user's breakpoint
+        
+        #! CHANGED: Added full_mask_j, completion_input_ids_j to loop
+        for (
+                grad_inputs_j, old_hidden_states_j, sampling_per_token_logps_j, 
+                full_mask_j, input_ids_j, completion_input_ids_j, mask_j, advantages_j, 
+                pixel_values_j, image_grid_thw_j, 
+                pixel_attention_mask_j, image_sizes_j
+            ) in \
+            zip(
+                grad_inputs_chunks, old_hidden_states, sampling_per_token_logps, 
+                full_mask, input_ids, completion_input_ids, mask, advantages, #! CHANGED
+                pixel_values, image_grid_thws, 
+                pixel_attention_masks, image_sizes_chunks
+            ):
 
-        for (grad_inputs_j, new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, sampling_per_token_logps_j, input_ids_j, mask_j, advantages_j, ) in \
-            zip(grad_inputs_chunks, new_hidden_states, old_hidden_states, ref_hidden_states, sampling_per_token_logps, input_ids, mask, advantages):
+            with autocaster:
+                if not _are_pixel_values_present:
+                    new_hidden_states_j = model(
+                        input_ids = input_ids_j,
+                        attention_mask = full_mask_j, #! CHANGED: Use full mask
+                        pixel_values = pixel_values_j,
+                        image_grid_thw = image_grid_thw_j,
+                        pixel_attention_mask = pixel_attention_mask_j,
+                        image_sizes = image_sizes_j,
+                        # logits_to_keep = logits_to_keep + 1,
+                    ).logits
 
-            # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
-
-            # mark_dynamic(new_hidden_states_j)
-            # mark_dynamic(ref_hidden_states_j)
-            # if old_hidden_states_j is not None: 
-            #     mark_dynamic(old_hidden_states_j)
-            # mark_dynamic(input_ids_j)
-            # mark_dynamic(mask_j)
-            
-            accumulate_chunk(
-                new_hidden_states_j,
-                old_hidden_states_j,
-                ref_hidden_states_j,
-                sampling_per_token_logps_j,
-                input_ids_j,
-                mask_j,
-                advantages_j,
-                scaling,
-                grad_inputs_j,
-            )
+                    #keep extra logit as we generated a new token
+                    # [BUG?]: This line used 'new_hidden_states' not 'new_hidden_states_j'
+                    new_hidden_states_j = new_hidden_states_j[:, -(logits_to_keep +max_left_pad+1): , :]
+                else: 
+                    new_hidden_states_j = model(
+                        input_ids = input_ids_j,
+                        attention_mask = full_mask_j, #! CHANGED: Use full mask
+                        pixel_values = pixel_values_j,
+                        image_grid_thw = image_grid_thw_j,
+                        pixel_attention_mask = pixel_attention_mask_j,
+                        image_sizes = image_sizes_j,
+                        logits_to_keep = logits_to_keep + 1,
+                    ).logits
+                
+                # Default ref_hidden_states_j to None
+                ref_hidden_states_j = None
+                with torch.no_grad():
+                    if beta != 0.0:
+                        if pixel_values_j is None:
+                            with model.disable_adapter():
+                                ref_hidden_states_j = model(
+                                    input_ids = input_ids_j,
+                                    attention_mask = full_mask_j, #! CHANGED: Use full mask
+                                    pixel_values = pixel_values_j,
+                                    image_grid_thw = image_grid_thw_j,
+                                    pixel_attention_mask = pixel_attention_mask_j,
+                                    image_sizes = image_sizes_j,
+                                    # logits_to_keep = logits_to_keep + 1,
+                                ).logits
+                            ref_hidden_states_j = ref_hidden_states_j[:, -(logits_to_keep +max_left_pad+1): , :]
+                        else: 
+                            with model.disable_adapter():
+                                ref_hidden_states_j = model(
+                                    input_ids = input_ids_j,
+                                    attention_mask = full_mask_j, #! CHANGED: Use full mask
+                                    pixel_values = pixel_values_j,
+                                    image_grid_thw = image_grid_thw_j,
+                                    pixel_attention_mask = pixel_attention_mask_j,
+                                    image_sizes = image_sizes_j,
+                                    logits_to_keep = logits_to_keep + 1,
+                                ).logits
+                    
+                # [TODO] Dynamic marking
+                #! CHANGED: Pass completion_input_ids_j as the input_ids_j argument
+                accumulate_chunk(
+                    new_hidden_states_j,
+                    old_hidden_states_j,
+                    ref_hidden_states_j,
+                    sampling_per_token_logps_j,
+                    completion_input_ids_j, #! Pass completion_ids for loss
+                    mask_j,                 #! Pass completion_mask for loss
+                    advantages_j,
+                    scaling,
+                    grad_inputs_j,
+                )
         pass
 
-        grad_inputs                  .div_(n_chunks)
-        accumulated_loss             .div_(n_chunks)
-        accumulated_completion_length.div_(n_chunks)
-        accumulated_mean_kl          .div_(n_chunks)
+        grad_inputs                   .div_(n_chunks)
+        accumulated_loss              .div_(n_chunks)
+        accumulated_completion_length .div_(n_chunks)
+        accumulated_mean_kl           .div_(n_chunks)
 
         if _sampling_per_token_logps is not None:
             accumulated_delta = torch.cat(accumulated_delta, dim=0)
@@ -509,6 +623,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         else:
             accumulated_delta = None
             accumulated_flat_is_ratio = None
+        
         ctx.save_for_backward(grad_inputs)
         return (
             accumulated_loss,
@@ -522,9 +637,18 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, dcompletion_length, dmean_kl, ddelta, ddflat_is_ratio):
         (grad_input,) = ctx.saved_tensors
-        return (grad_input, None, None, None, None, None, None, None, None, None, None, None)
+        
+        #! CHANGED: Matched None tuple to new 17 forward inputs
+        # (grad_input is for _old_hidden_states)
+        return (
+            grad_input, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
+        )
     pass
 pass
+
+# Assuming RL_REPLACEMENTS is a dict
+# RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 
 
@@ -583,6 +707,7 @@ def grpo_accumulated_loss(
         attention_mask = attention_mask.to(attention_mask.dtype)
     else: 
         completion_input_ids = input_ids[:, -logits_to_keep:]
+        max_left_pad = None
     
     unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
 
@@ -598,46 +723,25 @@ def grpo_accumulated_loss(
         autocaster = nullcontext()
     else:
         autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
-    with autocaster:
-        if pixel_values is None:
-            new_hidden_states = unwrapped_model(
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                pixel_values = pixel_values,
-                image_grid_thw = image_grid_thw,
-                pixel_attention_mask = pixel_attention_mask,
-                image_sizes = image_sizes,
-                # logits_to_keep = logits_to_keep + 1,
-            ).logits
-
-            #keep extra logit as we generated a new token
-            new_hidden_states = new_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-            if ref_hidden_states is not None: 
-                ref_hidden_states = ref_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-            if old_hidden_states is not None: 
-                old_hidden_states = old_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
-        else: 
-            new_hidden_states = unwrapped_model(
-                input_ids = input_ids,
-                attention_mask = attention_mask,
-                pixel_values = pixel_values,
-                image_grid_thw = image_grid_thw,
-                pixel_attention_mask = pixel_attention_mask,
-                image_sizes = image_sizes,
-                logits_to_keep = logits_to_keep + 1,
-            ).logits
+    if pixel_values is None and old_hidden_states is not None: 
+            old_hidden_states = old_hidden_states[:, -(logits_to_keep +max_left_pad+1): , :]
     loss, completion_length, mean_kl, delta, flat_is_ratio = UnslothEfficientGRPO.apply(
-        new_hidden_states,
         old_hidden_states,
-        ref_hidden_states,
         sampling_per_token_logps,
         lm_head,
+        attention_mask,
+        input_ids,
         completion_input_ids,
         completion_mask,
         advantages,
+        unwrapped_model, 
+        autocaster,
         trainer.beta,
+        logits_to_keep,
         trainer.accelerator.scaler,
+        max_left_pad,
         n_chunks,
+        trainer.ref_model,
         kwargs # pass kwargs as a dict
     )
 
