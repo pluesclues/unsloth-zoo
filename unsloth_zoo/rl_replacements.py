@@ -421,9 +421,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                     old_hidden_states = old_hidden_states[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
 
             loss, completion_length, mean_kl, delta, flat_is_ratio = grpo_compute_loss(
+                ref_hidden_states,
                 new_hidden_states,
                 old_hidden_states,
-                ref_hidden_states,
                 sampling_per_token_logps,
                 lm_head,
                 input_ids,
