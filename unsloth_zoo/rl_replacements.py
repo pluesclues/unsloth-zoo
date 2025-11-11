@@ -209,9 +209,9 @@ RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
 
 # Custom compiled GRPO loss - creates 3 Triton kernels
 def grpo_compute_loss(
-    ref_logits,
-    new_logits,
-    old_logits,
+    ref,
+    new,
+    old,
     sampling_per_token_logps,
     input_ids,
     mask,
@@ -238,45 +238,7 @@ def grpo_compute_loss(
     vllm_importance_sampling_cap = kwargs.get("vllm_importance_sampling_cap", 2.0)
     input_ids = input_ids.unsqueeze(-1)
 
-    # Optional logit softcapping and logit dividing
-    if logit_scale_multiply != 0: new_logits = new_logits * logit_scale_multiply
-    if logit_scale_divide   != 0: new_logits = new_logits / logit_scale_divide
-    if logit_softcapping    != 0: new_logits = new_logits * torch.tanh(new_logits / logit_softcapping)
-
-    new_logits = new_logits.to(torch.float32)
-    # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-    if temperature != 1.0: new_logits = new_logits / temperature
-    new_x = torch.gather(new_logits, dim = -1, index = input_ids).squeeze(-1)
-    new = new_x - torch.logsumexp(new_logits, dim = -1)
-    # x_i - logsumexp(x_i)
     with torch.no_grad():
-        if beta != 0.0:
-            assert ref_logits is not None, "ref_logits should not be None when beta != 0.0"
-            
-            # Optional logit softcapping and logit dividing
-            if logit_scale_multiply != 0: ref_logits = ref_logits * logit_scale_multiply
-            if logit_scale_divide   != 0: ref_logits = ref_logits / logit_scale_divide
-            if logit_softcapping    != 0: ref_logits = ref_logits * torch.tanh(ref_logits / logit_softcapping)
-
-            ref_logits = ref_logits.to(torch.float32)
-            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            if temperature != 1.0: ref_logits = ref_logits / temperature
-            ref_x = torch.gather(ref_logits, dim = -1, index = input_ids).squeeze(-1)
-            ref = ref_x - torch.logsumexp(ref_logits, dim = -1)
-        pass
-
-        if old_logits is not None:
-            # Optional logit softcapping and logit dividing
-            if logit_scale_multiply != 0: old_logits = old_logits * logit_scale_multiply
-            if logit_scale_divide   != 0: old_logits = old_logits / logit_scale_divide
-            if logit_softcapping    != 0: old_logits = old_logits * torch.tanh(old_logits / logit_softcapping)
-
-            old_logits = old_logits.to(torch.float32)
-            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            if temperature != 1.0: old_logits = old_logits / temperature
-            old_x = torch.gather(old_logits, dim = -1, index = input_ids).squeeze(-1)
-            old = old_x - torch.logsumexp(old_logits, dim = -1)
-        pass
         if use_vllm and sampling_per_token_logps is not None:
             #must filter out extra prompt tokens in begining after making input_ids left padded
             importance_sampling_ratio = torch.exp((old * mask) - sampling_per_token_logps)
@@ -284,7 +246,7 @@ def grpo_compute_loss(
                 importance_sampling_ratio, max=vllm_importance_sampling_cap
             )
         pass
-    pass
+    # pass
     
     # Reverse KL
     # Note that this is a low variance low bias estimator for the KL divergence as used in GRPO paper
@@ -302,7 +264,7 @@ def grpo_compute_loss(
 
     # Below is forward KL (normal KL)
     # kl_i = torch.exp(old) * (old - new)
-    if old_logits is not None: 
+    if old is not None: 
         log_ratio = new - old
     else:
         log_ratio = new - new.detach()
@@ -425,26 +387,12 @@ class UnslothEfficientGRPO(torch.autograd.Function):
         
         # This function is fine. 'input_ids' and 'mask' here will correctly
         # refer to completion_input_ids and completion_mask.
-        def compute_loss(new_hidden_states, old_hidden_states, ref_hidden_states, sampling_per_token_logps, input_ids, mask, advantages, scaling):
-            new_logits = torch.matmul(new_hidden_states.to(lm_head.dtype), lm_head.t())
-            new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-            with torch.no_grad():
-                if beta != 0.0:
-                    ref_logits = torch.matmul(ref_hidden_states.to(lm_head.dtype), lm_head.t())
-                    ref_logits = ref_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-                else:
-                    ref_logits = None
-                if old_hidden_states is not None:
-                    old_logits = torch.matmul(old_hidden_states.to(lm_head.dtype), lm_head.t())
-                    old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
-                else: 
-                    old_logits = None
-            
+        def compute_loss(new, old, ref, sampling_per_token_logps, input_ids, mask, advantages, scaling):
             # unsloth_zoo/rl_replacements.py
             loss, completion_length, mean_kl, delta, flat_is_ratio = grpo_compute_loss(
-                ref_logits,
-                new_logits,
-                old_logits,
+                ref,
+                new,
+                old,
                 sampling_per_token_logps,
                 input_ids, #! This is the completion_input_ids
                 mask,      #! This is the completion_mask
@@ -500,15 +448,14 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             dynamic = True,
             options = torch_compile_options,
         )
-
         def _get_model_logits(
             model,
-            input_ids_j,
-            full_mask_j,
-            pixel_values_j,
-            image_grid_thw_j,
-            pixel_attention_mask_j,
-            image_sizes_j,
+            input_ids,
+            full_mask,
+            pixel_values,
+            image_grid_thw,
+            pixel_attention_mask,
+            image_sizes,
             _are_pixel_values_present, # The boolean check
             logits_to_keep,
             max_left_pad,
@@ -520,71 +467,72 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
             if not _are_pixel_values_present:
                 logits = model(
-                    input_ids=input_ids_j,
-                    attention_mask=full_mask_j,
-                    pixel_values=pixel_values_j,
-                    image_grid_thw=image_grid_thw_j,
-                    pixel_attention_mask=pixel_attention_mask_j,
-                    image_sizes=image_sizes_j,
+                    input_ids=input_ids,
+                    attention_mask=full_mask,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    pixel_attention_mask=pixel_attention_mask,
+                    image_sizes=image_sizes,
                 ).logits
                 # Slice after, as per the original 'if' block
                 logits = logits[:, -(logits_to_keep + max_left_pad + 1) :, :]
             else:
                 # Pass logits_to_keep directly, as per the original 'else' block
                 logits = model(
-                    input_ids=input_ids_j,
-                    attention_mask=full_mask_j,
-                    pixel_values=pixel_values_j,
-                    image_grid_thw=image_grid_thw_j,
-                    pixel_attention_mask=pixel_attention_mask_j,
-                    image_sizes=image_sizes_j,
+                    input_ids=input_ids,
+                    attention_mask=full_mask,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    pixel_attention_mask=pixel_attention_mask,
+                    image_sizes=image_sizes,
                     logits_to_keep=logits_to_keep + 1,
                 ).logits
             os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
             logits = logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
             return logits
 
-
-        def _calculate_logprobs(
-            hidden_states, # e.g., new_hidden_states_j or ref_hidden_states_j
-            completion_input_ids,
-            lm_head,
-            logit_scale_multiply,
-            logit_scale_divide,
-            logit_softcapping,
-            temperature,
-            inner_chunks=64 # From your comment
-        ):
-            """
-            Helper function to calculate logprobs from hidden states,
-            encapsulating the batch-chunking logic.
-            """
-            # If hidden_states is None (e.g., ref_hidden_states when beta=0), return None
-            if hidden_states is None:
-                return None
-
-            B = hidden_states.shape[0]
-            outer_chunks = B  # Chunk by batch size
-
-            all_logprobs_list = []
-            hidden_states_chunks = torch.chunk(hidden_states, chunks=outer_chunks, dim=0)
-            completion_ids_chunks = torch.chunk(completion_input_ids, chunks=outer_chunks, dim=0)
-
-            for logits_chunk, input_ids_chunk in zip(hidden_states_chunks, completion_ids_chunks):
-                logprobs_chunk = chunked_hidden_states_selective_log_softmax(
-                    logits_chunk,
-                    lm_head,
-                    input_ids_chunk,
-                    chunks=inner_chunks, # The inner chunking
-                    logit_scale_multiply=logit_scale_multiply,
-                    logit_scale_divide=logit_scale_divide,
-                    logit_softcapping=logit_softcapping,
-                    temperature=temperature,
-                )
-                all_logprobs_list.append(logprobs_chunk)
-
-            return torch.cat(all_logprobs_list, dim=0)
-
+        # def _get_model_logits(
+        #     model,
+        #     input_ids_j,
+        #     full_mask_j,
+        #     pixel_values_j,
+        #     image_grid_thw_j,
+        #     pixel_attention_mask_j,
+        #     image_sizes_j,
+        #     _are_pixel_values_present, # The boolean check
+        #     logits_to_keep,
+        #     max_left_pad,
+        # ):
+        #     """
+        #     Helper function to run a single model forward pass,
+        #     encapsulating the if/else logic for pixel values.
+        #     """
+        #     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+        #     if not _are_pixel_values_present:
+        #         logits = model(
+        #             input_ids=input_ids_j,
+        #             attention_mask=full_mask_j,
+        #             pixel_values=pixel_values_j,
+        #             image_grid_thw=image_grid_thw_j,
+        #             pixel_attention_mask=pixel_attention_mask_j,
+        #             image_sizes=image_sizes_j,
+        #         ).logits
+        #         # Slice after, as per the original 'if' block
+        #         logits = logits[:, -(logits_to_keep + max_left_pad + 1) :, :]
+        #     else:
+        #         # Pass logits_to_keep directly, as per the original 'else' block
+        #         logits = model(
+        #             input_ids=input_ids_j,
+        #             attention_mask=full_mask_j,
+        #             pixel_values=pixel_values_j,
+        #             image_grid_thw=image_grid_thw_j,
+        #             pixel_attention_mask=pixel_attention_mask_j,
+        #             image_sizes=image_sizes_j,
+        #             logits_to_keep=logits_to_keep + 1,
+        #         ).logits
+        #     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
+        #     logits = logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred 
+        #     return logits
 
         # --- Main Fused Function ---
 
@@ -617,12 +565,12 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             Calculates and returns the log probabilities for both the
             policy model (new) and the reference model (ref).
             """
-
+            
             # 1. Calculate policy hidden states
             new_hidden_states_j = _get_model_logits(
                 model=model,
-                input_ids_j=input_ids_j,
-                full_mask_j=full_mask_j,
+                input_ids=input_ids_j,
+                full_mask=full_mask_j,
                 pixel_values=pixel_values_j,
                 image_grid_thw=image_grid_thw_j,
                 pixel_attention_mask=pixel_attention_mask_j,
@@ -630,6 +578,17 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                 _are_pixel_values_present=_are_pixel_values_present,
                 logits_to_keep=logits_to_keep,
                 max_left_pad=max_left_pad,
+            )
+            # 3. Calculate logprobs for policy
+            new_logprobs = chunked_hidden_states_selective_log_softmax(
+                hidden_states=new_hidden_states_j,
+                index=completion_input_ids,
+                lm_head=lm_head,
+                logit_scale_multiply=logit_scale_multiply,
+                logit_scale_divide=logit_scale_divide,
+                logit_softcapping=logit_softcapping,
+                temperature=temperature,
+                chunks=inner_logprob_chunks
             )
 
             # 2. Calculate reference hidden states
@@ -639,41 +598,27 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                     with model.disable_adapter():
                         ref_hidden_states_j = _get_model_logits(
                             model=model,
-                            input_ids_j=input_ids_j,
-                            full_mask_j=full_mask_j,
-                            pixel_values=pixel_values_j,
+                            input_ids=input_ids_j,
+                            full_mask=full_mask_j,
+                            pixel_values= pixel_values_j,
                             image_grid_thw=image_grid_thw_j,
                             pixel_attention_mask=pixel_attention_mask_j,
                             image_sizes=image_sizes_j,
-                            # Faithfully using the check from your original 'ref' block
-                            _are_pixel_values_present=(pixel_values_j is None),
+                            _are_pixel_values_present=_are_pixel_values_present,
                             logits_to_keep=logits_to_keep,
                             max_left_pad=max_left_pad,
                         )
-
-            # 3. Calculate logprobs for policy
-            new_logprobs = _calculate_logprobs(
-                hidden_states=new_hidden_states_j,
-                completion_input_ids=completion_input_ids,
-                lm_head=lm_head,
-                logit_scale_multiply=logit_scale_multiply,
-                logit_scale_divide=logit_scale_divide,
-                logit_softcapping=logit_softcapping,
-                temperature=temperature,
-                inner_chunks=inner_logprob_chunks
-            )
-
-            # 4. Calculate logprobs for reference
-            ref_logprobs = _calculate_logprobs(
-                hidden_states=ref_hidden_states_j, # Handles None if beta == 0.0
-                completion_input_ids=completion_input_ids,
-                lm_head=lm_head,
-                logit_scale_multiply=logit_scale_multiply,
-                logit_scale_divide=logit_scale_divide,
-                logit_softcapping=logit_softcapping,
-                temperature=temperature,
-                inner_chunks=inner_logprob_chunks
-            )
+                    # 4. Calculate logprobs for reference
+                    ref_logprobs = chunked_hidden_states_selective_log_softmax(
+                        hidden_states=ref_hidden_states_j, # Handles None if beta == 0.0
+                        index=completion_input_ids,
+                        lm_head=lm_head,
+                        logit_scale_multiply=logit_scale_multiply,
+                        logit_scale_divide=logit_scale_divide,
+                        logit_softcapping=logit_softcapping,
+                        temperature=temperature,
+                        chunks=inner_logprob_chunks
+                    )
 
             return new_logprobs, ref_logprobs
         pixel_values = extra_kwargs.get('pixel_values',None)
@@ -760,7 +705,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
                     image_grid_thw_j,
                     pixel_attention_mask_j,
                     image_sizes_j,
-                    completion_input_ids, # From the logprob calculation part
+                    completion_input_ids_j, # From the logprob calculation part
                     lm_head,              # From the logprob calculation part
                     
                     # --- Control Parameters ---
