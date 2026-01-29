@@ -359,16 +359,16 @@ def grpo_compute_loss(
     coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
 
     if delta is not None:
-        loss_1 = torch.clamp(coef_1, max=delta) * advantages.unsqueeze(1)
+        loss_1 = torch.clamp(coef_1, max=delta) * advantages
     else:
-        loss_1 = coef_1 * advantages.unsqueeze(1)
+        loss_1 = coef_1 * advantages
     pass
 
     # Must detach - otherwise gradients are not propagated correctly!
     # exp(x - x) == 1
-    # loss_i = torch.exp(new - new.detach()) * advantages.unsqueeze(1)
+    # loss_i = torch.exp(new - new.detach()) * advantages
 
-    loss_2 = coef_2 * advantages.unsqueeze(1)
+    loss_2 = coef_2 * advantages
     loss_i = -torch.min(loss_1, loss_2)
 
     if use_vllm and sampling_per_token_logps is not None:
